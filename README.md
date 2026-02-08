@@ -6,4 +6,4 @@ To build and run
 make
 
 # run
-./gameboy <rom.gb>`
+./gameboy <rom.gb>
