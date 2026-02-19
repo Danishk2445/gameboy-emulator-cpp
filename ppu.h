@@ -54,12 +54,12 @@ private:
     // Framebuffer (160x144 ARGB)
     std::array<uint32_t, 160 * 144> framebuffer;
     
-    // DMG color palette
+    // DMG color palette (original grayscale)
     static constexpr uint32_t colors[4] = {
-        0xFFE0F8D0,  // Lightest (white)
-        0xFF88C070,  // Light
-        0xFF346856,  // Dark
-        0xFF081820   // Darkest (black)
+        0xFFFFFFFF,  // White
+        0xFFAAAAAA,  // Light gray
+        0xFF555555,  // Dark gray
+        0xFF000000   // Black
     };
     
     void renderScanline();
