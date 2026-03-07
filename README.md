@@ -1,4 +1,5 @@
-<img width="649" height="615" alt="Screenshot_20260208_104028" src="https://github.com/user-attachments/assets/a4710bed-27a1-4061-b75d-98961666d869" />
+<img width="640" height="597" alt="image" src="https://github.com/user-attachments/assets/9533ecf8-76e2-45a6-b938-d0168bcc7b43" />
+
 
 To build and run
 ```bash
