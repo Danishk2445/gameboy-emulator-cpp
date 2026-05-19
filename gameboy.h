@@ -7,39 +7,60 @@ class CPU;
 class Memory;
 class PPU;
 class APU;
+class UI;
 
 class GameBoy {
 public:
     GameBoy();
     ~GameBoy();
-    
-    // Initialize emulator
+
     bool init();
-    
-    // Load ROM file
     bool loadROM(const std::string& path);
-    
-    // Run the emulator
     void run();
-    
+
 private:
-    // Components
-    Memory* memory;
-    CPU* cpu;
-    PPU* ppu;
-    APU* apu;
-    
-    // SDL
-    SDL_Window* window;
-    SDL_Renderer* renderer;
-    SDL_Texture* texture;
-    
-    bool running;
-    
-    // Frame timing
-    static constexpr int CYCLES_PER_FRAME = 70224;  // 4194304 Hz / 59.73 FPS
+    Memory* memory = nullptr;
+    CPU*    cpu    = nullptr;
+    PPU*    ppu    = nullptr;
+    APU*    apu    = nullptr;
+    UI*     ui     = nullptr;
+
+    SDL_Window*   window   = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    SDL_Texture*  texture  = nullptr;
+
+    bool running = false;
+    bool paused = false;
+    bool fastForward = false;
+    bool fullscreen = false;
+    bool muted = false;
+    int  windowScale = 4;
+    int  saveSlot = 0;
+    int  paletteIdx = 1;
+
+    uint8_t buttons = 0x0F;
+    uint8_t dpad    = 0x0F;
+
+    static constexpr int    CYCLES_PER_FRAME = 70224;
     static constexpr double FRAME_TIME = 1000.0 / 59.7275;
-    
-    void handleInput(const SDL_Event& event);
-    void updateTexture();
+    static constexpr int    FAST_FORWARD_FRAMES = 4;
+
+    void pollInput();
+    void presentFrame();
+    void runOneFrame();
+    void applyUIAction();
+
+    void resetGame();
+    bool unloadCurrentROM();
+
+    bool saveStateToFile(const std::string& path);
+    bool loadStateFromFile(const std::string& path);
+    void saveStateSlot(int slot);
+    void loadStateSlot(int slot);
+    std::string statePathForSlot(int slot) const;
+    void takeScreenshot();
+
+    void setPaletteByIndex(int idx);
+    const char* paletteName(int idx) const;
+    void toggleFullscreen();
 };

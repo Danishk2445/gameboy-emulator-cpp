@@ -1,10 +1,10 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -O2 -Wall -Wextra
-LDFLAGS = $(shell sdl2-config --libs)
 CPPFLAGS = $(shell sdl2-config --cflags)
+LDFLAGS  = $(shell sdl2-config --libs)
 
 TARGET = gameboy
-SRCS = main.cpp gameboy.cpp cpu.cpp memory.cpp ppu.cpp apu.cpp
+SRCS = main.cpp gameboy.cpp cpu.cpp memory.cpp ppu.cpp apu.cpp ui.cpp
 OBJS = $(SRCS:.cpp=.o)
 
 all: $(TARGET)

@@ -1,500 +1,551 @@
 #include "apu.h"
+#include "memory.h"
+
+#include <iostream>
 #include <cstring>
 #include <algorithm>
-#include <cmath>
+#include <ostream>
+#include <istream>
 
-APU::APU() : audioDevice(0), writePos(0), readPos(0), masterEnable(true) {
+void APU::saveState(std::ostream& out) const {
+    auto W = [&](const auto& x) {
+        out.write(reinterpret_cast<const char*>(&x), sizeof(x));
+    };
+    W(ch1); W(ch2); W(ch3); W(ch4);
+    W(nr50); W(nr51);
+    uint8_t pwr = powered ? 1 : 0;
+    W(pwr);
+    W(frameSeqCounter);
+    W(frameSeqStep);
+    W(sampleAccum);
+}
+
+bool APU::loadState(std::istream& in) {
+    auto R = [&](auto& x) {
+        return static_cast<bool>(
+            in.read(reinterpret_cast<char*>(&x), sizeof(x)));
+    };
+    if (!R(ch1) || !R(ch2) || !R(ch3) || !R(ch4)) return false;
+    if (!R(nr50) || !R(nr51)) return false;
+    uint8_t pwr = 0;
+    if (!R(pwr)) return false;
+    powered = pwr != 0;
+    if (!R(frameSeqCounter) || !R(frameSeqStep) || !R(sampleAccum)) return false;
+    // Drain audio ring buffer so we don't play stale samples.
+    if (device) SDL_LockAudioDevice(device);
+    writeIdx.store(0);
+    readIdx.store(0);
+    std::memset(ring, 0, sizeof(ring));
+    if (device) SDL_UnlockAudioDevice(device);
+    return true;
+}
+
+namespace {
+constexpr uint8_t DUTY_TABLE[4] = { 0b00000001, 0b10000001, 0b10000111, 0b01111110 };
+constexpr int NOISE_DIVISORS[8] = { 8, 16, 32, 48, 64, 80, 96, 112 };
+}
+
+APU::APU(Memory& mem) : memory(mem) {
     reset();
 }
 
 APU::~APU() {
-    if (audioDevice) {
-        SDL_CloseAudioDevice(audioDevice);
+    if (device) {
+        SDL_CloseAudioDevice(device);
+        device = 0;
     }
 }
 
 bool APU::init() {
-    SDL_AudioSpec want, have;
-    
-    SDL_memset(&want, 0, sizeof(want));
-    want.freq = SAMPLE_RATE;
-    want.format = AUDIO_F32SYS;
-    want.channels = 2;
-    want.samples = 512;
-    want.callback = audioCallback;
-    want.userdata = this;
-    
-    audioDevice = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
-    if (audioDevice == 0) {
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        std::cerr << "SDL audio init failed: " << SDL_GetError() << '\n';
         return false;
     }
-    
-    SDL_PauseAudioDevice(audioDevice, 0);
+    SDL_AudioSpec want{}, have{};
+    want.freq     = SAMPLE_RATE;
+    want.format   = AUDIO_S16SYS;
+    want.channels = 2;
+    want.samples  = 1024;
+    want.callback = &APU::audioCallback;
+    want.userdata = this;
+    device = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (device == 0) {
+        std::cerr << "SDL_OpenAudioDevice failed: " << SDL_GetError() << '\n';
+        return false;
+    }
+    SDL_PauseAudioDevice(device, 0);
     return true;
 }
 
 void APU::reset() {
-    registers.fill(0);
-    waveRam.fill(0);
-    ringBuffer.fill(0);
-    
-    memset(&ch1, 0, sizeof(ch1));
-    memset(&ch2, 0, sizeof(ch2));
-    memset(&ch3, 0, sizeof(ch3));
-    memset(&ch4, 0, sizeof(ch4));
-    
+    ch1 = Square{};
+    ch2 = Square{};
+    ch3 = Wave{};
+    ch4 = Noise{};
     ch4.lfsr = 0x7FFF;
-    
-    frameSequencerCycles = 0;
-    frameSequencerStep = 0;
-    sampleAccumulator = 0;
-    
-    writePos = 0;
-    readPos = 0;
-    
-    masterEnable = true;
-    masterVolume = 0x77;
-    channelPan = 0xFF;
-}
-
-void APU::writeRegister(uint8_t reg, uint8_t val) {
-    if (reg >= 0x30 && reg <= 0x3F) {
-        waveRam[reg - 0x30] = val;
-        return;
-    }
-    
-    if (reg < 0x10 || reg > 0x26) return;
-    
-    registers[reg - 0x10] = val;
-    
-    switch (reg) {
-        // Channel 1 - Square with sweep
-        case 0x10:  // NR10 - Sweep
-            ch1.sweepPeriod = (val >> 4) & 0x07;
-            ch1.sweepNegate = (val & 0x08) != 0;
-            ch1.sweepShift = val & 0x07;
-            break;
-            
-        case 0x11:  // NR11 - Length/Duty
-            ch1.duty = (val >> 6) & 0x03;
-            ch1.lengthCounter = 64 - (val & 0x3F);
-            break;
-            
-        case 0x12:  // NR12 - Volume envelope
-            ch1.volumeInit = (val >> 4) & 0x0F;
-            ch1.envelopeAdd = (val & 0x08) != 0;
-            ch1.envelopePeriod = val & 0x07;
-            if ((val & 0xF8) == 0) ch1.enabled = false;
-            break;
-            
-        case 0x13:  // NR13 - Frequency low
-            ch1.frequency = (ch1.frequency & 0x700) | val;
-            break;
-            
-        case 0x14:  // NR14 - Frequency high + trigger
-            ch1.frequency = (ch1.frequency & 0xFF) | ((val & 0x07) << 8);
-            ch1.lengthEnabled = (val & 0x40) != 0;
-            if (val & 0x80) triggerChannel1();
-            break;
-            
-        // Channel 2 - Square
-        case 0x16:  // NR21 - Length/Duty
-            ch2.duty = (val >> 6) & 0x03;
-            ch2.lengthCounter = 64 - (val & 0x3F);
-            break;
-            
-        case 0x17:  // NR22 - Volume envelope
-            ch2.volumeInit = (val >> 4) & 0x0F;
-            ch2.envelopeAdd = (val & 0x08) != 0;
-            ch2.envelopePeriod = val & 0x07;
-            if ((val & 0xF8) == 0) ch2.enabled = false;
-            break;
-            
-        case 0x18:  // NR23 - Frequency low
-            ch2.frequency = (ch2.frequency & 0x700) | val;
-            break;
-            
-        case 0x19:  // NR24 - Frequency high + trigger
-            ch2.frequency = (ch2.frequency & 0xFF) | ((val & 0x07) << 8);
-            ch2.lengthEnabled = (val & 0x40) != 0;
-            if (val & 0x80) triggerChannel2();
-            break;
-            
-        // Channel 3 - Wave
-        case 0x1A:  // NR30 - DAC enable
-            ch3.dacEnabled = (val & 0x80) != 0;
-            if (!ch3.dacEnabled) ch3.enabled = false;
-            break;
-            
-        case 0x1B:  // NR31 - Length
-            ch3.lengthCounter = 256 - val;
-            break;
-            
-        case 0x1C:  // NR32 - Volume
-            ch3.volume = (val >> 5) & 0x03;
-            break;
-            
-        case 0x1D:  // NR33 - Frequency low
-            ch3.frequency = (ch3.frequency & 0x700) | val;
-            break;
-            
-        case 0x1E:  // NR34 - Frequency high + trigger
-            ch3.frequency = (ch3.frequency & 0xFF) | ((val & 0x07) << 8);
-            ch3.lengthEnabled = (val & 0x40) != 0;
-            if (val & 0x80) triggerChannel3();
-            break;
-            
-        // Channel 4 - Noise
-        case 0x20:  // NR41 - Length
-            ch4.lengthCounter = 64 - (val & 0x3F);
-            break;
-            
-        case 0x21:  // NR42 - Volume envelope
-            ch4.volumeInit = (val >> 4) & 0x0F;
-            ch4.envelopeAdd = (val & 0x08) != 0;
-            ch4.envelopePeriod = val & 0x07;
-            if ((val & 0xF8) == 0) ch4.enabled = false;
-            break;
-            
-        case 0x22:  // NR43 - Polynomial counter
-            ch4.shift = (val >> 4) & 0x0F;
-            ch4.widthMode = (val & 0x08) != 0;
-            ch4.divisor = val & 0x07;
-            break;
-            
-        case 0x23:  // NR44 - Trigger
-            ch4.lengthEnabled = (val & 0x40) != 0;
-            if (val & 0x80) triggerChannel4();
-            break;
-            
-        // Master control
-        case 0x24:  // NR50 - Master volume
-            masterVolume = val;
-            break;
-            
-        case 0x25:  // NR51 - Channel panning
-            channelPan = val;
-            break;
-            
-        case 0x26:  // NR52 - Sound on/off
-            masterEnable = (val & 0x80) != 0;
-            if (!masterEnable) {
-                // Don't call reset() as it would reset the audio device
-                ch1.enabled = ch2.enabled = ch3.enabled = ch4.enabled = false;
-            }
-            break;
-    }
-}
-
-uint8_t APU::readRegister(uint8_t reg) const {
-    if (reg >= 0x30 && reg <= 0x3F) {
-        return waveRam[reg - 0x30];
-    }
-    
-    if (reg < 0x10 || reg > 0x26) return 0xFF;
-    
-    // NR52 - Sound on/off status
-    if (reg == 0x26) {
-        uint8_t status = masterEnable ? 0x80 : 0x00;
-        if (ch1.enabled) status |= 0x01;
-        if (ch2.enabled) status |= 0x02;
-        if (ch3.enabled) status |= 0x04;
-        if (ch4.enabled) status |= 0x08;
-        return status | 0x70;
-    }
-    
-    return registers[reg - 0x10];
-}
-
-void APU::triggerChannel1() {
-    ch1.enabled = true;
-    if (ch1.lengthCounter == 0) ch1.lengthCounter = 64;
-    ch1.frequencyTimer = (2048 - ch1.frequency) * 4;
-    ch1.envelopeTimer = ch1.envelopePeriod;
-    ch1.volume = ch1.volumeInit;
-    ch1.shadowFreq = ch1.frequency;
-    ch1.sweepTimer = ch1.sweepPeriod > 0 ? ch1.sweepPeriod : 8;
-    ch1.sweepEnabled = ch1.sweepPeriod > 0 || ch1.sweepShift > 0;
-    ch1.dutyPos = 0;
-}
-
-void APU::triggerChannel2() {
-    ch2.enabled = true;
-    if (ch2.lengthCounter == 0) ch2.lengthCounter = 64;
-    ch2.frequencyTimer = (2048 - ch2.frequency) * 4;
-    ch2.envelopeTimer = ch2.envelopePeriod;
-    ch2.volume = ch2.volumeInit;
-    ch2.dutyPos = 0;
-}
-
-void APU::triggerChannel3() {
-    ch3.enabled = ch3.dacEnabled;
-    if (ch3.lengthCounter == 0) ch3.lengthCounter = 256;
-    ch3.frequencyTimer = (2048 - ch3.frequency) * 2;
-    ch3.samplePos = 0;
-}
-
-void APU::triggerChannel4() {
-    ch4.enabled = true;
-    if (ch4.lengthCounter == 0) ch4.lengthCounter = 64;
-    ch4.envelopeTimer = ch4.envelopePeriod;
-    ch4.volume = ch4.volumeInit;
-    ch4.lfsr = 0x7FFF;
-    
-    int divisors[] = { 8, 16, 32, 48, 64, 80, 96, 112 };
-    ch4.frequencyTimer = divisors[ch4.divisor] << ch4.shift;
-}
-
-float APU::getChannel1Output() {
-    if (!ch1.enabled) return 0.0f;
-    
-    uint8_t duty = dutyPatterns[ch1.duty];
-    int bit = (duty >> (7 - ch1.dutyPos)) & 1;
-    return bit ? (ch1.volume / 15.0f) : -(ch1.volume / 15.0f);
-}
-
-float APU::getChannel2Output() {
-    if (!ch2.enabled) return 0.0f;
-    
-    uint8_t duty = dutyPatterns[ch2.duty];
-    int bit = (duty >> (7 - ch2.dutyPos)) & 1;
-    return bit ? (ch2.volume / 15.0f) : -(ch2.volume / 15.0f);
-}
-
-float APU::getChannel3Output() {
-    if (!ch3.enabled || !ch3.dacEnabled) return 0.0f;
-    
-    uint8_t sample = waveRam[ch3.samplePos / 2];
-    if ((ch3.samplePos & 1) == 0) {
-        sample = (sample >> 4) & 0x0F;
-    } else {
-        sample = sample & 0x0F;
-    }
-    
-    int shift = 0;
-    switch (ch3.volume) {
-        case 0: return 0.0f;
-        case 1: shift = 0; break;
-        case 2: shift = 1; break;
-        case 3: shift = 2; break;
-    }
-    
-    float out = ((sample >> shift) - 7.5f) / 7.5f;
-    return out * 0.5f;  // Wave channel is quieter
-}
-
-float APU::getChannel4Output() {
-    if (!ch4.enabled) return 0.0f;
-    // LFSR bit 0 inverted gives the output
-    return (ch4.lfsr & 1) ? -(ch4.volume / 15.0f) : (ch4.volume / 15.0f);
-}
-
-void APU::stepFrameSequencer() {
-    // Length counter on steps 0, 2, 4, 6
-    if ((frameSequencerStep & 1) == 0) {
-        if (ch1.lengthEnabled && ch1.lengthCounter > 0) {
-            if (--ch1.lengthCounter == 0) ch1.enabled = false;
-        }
-        if (ch2.lengthEnabled && ch2.lengthCounter > 0) {
-            if (--ch2.lengthCounter == 0) ch2.enabled = false;
-        }
-        if (ch3.lengthEnabled && ch3.lengthCounter > 0) {
-            if (--ch3.lengthCounter == 0) ch3.enabled = false;
-        }
-        if (ch4.lengthEnabled && ch4.lengthCounter > 0) {
-            if (--ch4.lengthCounter == 0) ch4.enabled = false;
-        }
-    }
-    
-    // Sweep on steps 2, 6
-    if (frameSequencerStep == 2 || frameSequencerStep == 6) {
-        if (ch1.sweepEnabled && ch1.sweepPeriod > 0) {
-            if (--ch1.sweepTimer <= 0) {
-                ch1.sweepTimer = ch1.sweepPeriod > 0 ? ch1.sweepPeriod : 8;
-                
-                int newFreq = ch1.shadowFreq >> ch1.sweepShift;
-                if (ch1.sweepNegate) {
-                    newFreq = ch1.shadowFreq - newFreq;
-                } else {
-                    newFreq = ch1.shadowFreq + newFreq;
-                }
-                
-                if (newFreq > 2047) {
-                    ch1.enabled = false;
-                } else if (ch1.sweepShift > 0) {
-                    ch1.shadowFreq = newFreq;
-                    ch1.frequency = newFreq;
-                }
-            }
-        }
-    }
-    
-    // Envelope on step 7
-    if (frameSequencerStep == 7) {
-        if (ch1.envelopePeriod > 0) {
-            if (--ch1.envelopeTimer <= 0) {
-                ch1.envelopeTimer = ch1.envelopePeriod;
-                if (ch1.envelopeAdd && ch1.volume < 15) ch1.volume++;
-                else if (!ch1.envelopeAdd && ch1.volume > 0) ch1.volume--;
-            }
-        }
-        if (ch2.envelopePeriod > 0) {
-            if (--ch2.envelopeTimer <= 0) {
-                ch2.envelopeTimer = ch2.envelopePeriod;
-                if (ch2.envelopeAdd && ch2.volume < 15) ch2.volume++;
-                else if (!ch2.envelopeAdd && ch2.volume > 0) ch2.volume--;
-            }
-        }
-        if (ch4.envelopePeriod > 0) {
-            if (--ch4.envelopeTimer <= 0) {
-                ch4.envelopeTimer = ch4.envelopePeriod;
-                if (ch4.envelopeAdd && ch4.volume < 15) ch4.volume++;
-                else if (!ch4.envelopeAdd && ch4.volume > 0) ch4.volume--;
-            }
-        }
-    }
-    
-    frameSequencerStep = (frameSequencerStep + 1) & 7;
-}
-
-void APU::stepChannels() {
-    // Channel 1
-    if (ch1.frequencyTimer > 0) {
-        ch1.frequencyTimer--;
-    }
-    if (ch1.frequencyTimer <= 0) {
-        ch1.frequencyTimer = (2048 - ch1.frequency) * 4;
-        ch1.dutyPos = (ch1.dutyPos + 1) & 7;
-    }
-    
-    // Channel 2
-    if (ch2.frequencyTimer > 0) {
-        ch2.frequencyTimer--;
-    }
-    if (ch2.frequencyTimer <= 0) {
-        ch2.frequencyTimer = (2048 - ch2.frequency) * 4;
-        ch2.dutyPos = (ch2.dutyPos + 1) & 7;
-    }
-    
-    // Channel 3
-    if (ch3.frequencyTimer > 0) {
-        ch3.frequencyTimer--;
-    }
-    if (ch3.frequencyTimer <= 0) {
-        ch3.frequencyTimer = (2048 - ch3.frequency) * 2;
-        ch3.samplePos = (ch3.samplePos + 1) & 31;
-    }
-    
-    // Channel 4
-    if (ch4.frequencyTimer > 0) {
-        ch4.frequencyTimer--;
-    }
-    if (ch4.frequencyTimer <= 0) {
-        int divisors[] = { 8, 16, 32, 48, 64, 80, 96, 112 };
-        ch4.frequencyTimer = divisors[ch4.divisor] << ch4.shift;
-        
-        int xorResult = (ch4.lfsr & 1) ^ ((ch4.lfsr >> 1) & 1);
-        ch4.lfsr = (ch4.lfsr >> 1) | (xorResult << 14);
-        if (ch4.widthMode) {
-            ch4.lfsr &= ~(1 << 6);
-            ch4.lfsr |= xorResult << 6;
-        }
-    }
-}
-
-void APU::generateSample() {
-    if (!masterEnable) {
-        // Write silence
-        int wp = writePos.load();
-        int nextWp = (wp + 2) % (BUFFER_SIZE * 2);
-        if (nextWp != readPos.load()) {
-            ringBuffer[wp] = 0.0f;
-            ringBuffer[wp + 1] = 0.0f;
-            writePos.store(nextWp);
-        }
-        return;
-    }
-    
-    float left = 0.0f, right = 0.0f;
-    
-    float ch1Out = getChannel1Output();
-    float ch2Out = getChannel2Output();
-    float ch3Out = getChannel3Output();
-    float ch4Out = getChannel4Output();
-    
-    // Panning
-    if (channelPan & 0x10) left += ch1Out;
-    if (channelPan & 0x01) right += ch1Out;
-    if (channelPan & 0x20) left += ch2Out;
-    if (channelPan & 0x02) right += ch2Out;
-    if (channelPan & 0x40) left += ch3Out;
-    if (channelPan & 0x04) right += ch3Out;
-    if (channelPan & 0x80) left += ch4Out;
-    if (channelPan & 0x08) right += ch4Out;
-    
-    // Master volume (0-7, normalized)
-    float leftVol = (((masterVolume >> 4) & 0x07) + 1) / 8.0f;
-    float rightVol = ((masterVolume & 0x07) + 1) / 8.0f;
-    
-    left *= leftVol * 0.25f;  // Divide by 4 channels
-    right *= rightVol * 0.25f;
-    
-    // Clamp
-    left = std::max(-1.0f, std::min(1.0f, left));
-    right = std::max(-1.0f, std::min(1.0f, right));
-    
-    // Write to ring buffer (stereo)
-    int wp = writePos.load();
-    int rp = readPos.load();
-    int nextWp = (wp + 2) % (BUFFER_SIZE * 2);
-    
-    // Check if buffer has space
-    if (nextWp != rp) {
-        ringBuffer[wp] = left;
-        ringBuffer[wp + 1] = right;
-        writePos.store(nextWp);
-    }
-}
-
-void APU::step(int cycles) {
-    // Frame sequencer at 512 Hz (every 8192 cycles)
-    frameSequencerCycles += cycles;
-    while (frameSequencerCycles >= 8192) {
-        frameSequencerCycles -= 8192;
-        stepFrameSequencer();
-    }
-    
-    // Step channels and generate samples
-    for (int i = 0; i < cycles; i++) {
-        stepChannels();
-        
-        // Generate sample at the right rate
-        sampleAccumulator += SAMPLE_RATE;
-        while (sampleAccumulator >= CPU_CLOCK) {
-            sampleAccumulator -= CPU_CLOCK;
-            generateSample();
-        }
-    }
+    nr50 = 0x77;
+    nr51 = 0xF3;
+    powered = true;
+    frameSeqCounter = 0;
+    frameSeqStep = 0;
+    sampleAccum = 0.0;
+    writeIdx = 0;
+    readIdx = 0;
+    std::memset(ring, 0, sizeof(ring));
 }
 
 void APU::audioCallback(void* userdata, Uint8* stream, int len) {
     APU* apu = static_cast<APU*>(userdata);
-    float* output = reinterpret_cast<float*>(stream);
-    int samples = len / sizeof(float);  // Total floats needed (stereo pairs)
-    
-    for (int i = 0; i < samples; i += 2) {
-        int rp = apu->readPos.load();
-        int wp = apu->writePos.load();
-        
-        if (rp != wp) {
-            // Read from ring buffer
-            output[i] = apu->ringBuffer[rp];
-            output[i + 1] = apu->ringBuffer[rp + 1];
-            apu->readPos.store((rp + 2) % (BUFFER_SIZE * 2));
-        } else {
-            // Buffer underrun - output silence
-            output[i] = 0.0f;
-            output[i + 1] = 0.0f;
+    int16_t* out = reinterpret_cast<int16_t*>(stream);
+    int frames = len / (2 * sizeof(int16_t));
+    int r = apu->readIdx.load(std::memory_order_acquire);
+    int w = apu->writeIdx.load(std::memory_order_acquire);
+    int available = (w - r + BUFFER_FRAMES) % BUFFER_FRAMES;
+    int take = std::min(frames, available);
+    for (int i = 0; i < take; ++i) {
+        out[i * 2]     = apu->ring[r * 2];
+        out[i * 2 + 1] = apu->ring[r * 2 + 1];
+        r = (r + 1) % BUFFER_FRAMES;
+    }
+    for (int i = take; i < frames; ++i) {
+        out[i * 2]     = 0;
+        out[i * 2 + 1] = 0;
+    }
+    apu->readIdx.store(r, std::memory_order_release);
+}
+
+void APU::pushSample(int16_t l, int16_t r) {
+    int w = writeIdx.load(std::memory_order_relaxed);
+    int rd = readIdx.load(std::memory_order_acquire);
+    int next = (w + 1) % BUFFER_FRAMES;
+    if (next == rd) {
+        // buffer full — drop sample
+        return;
+    }
+    ring[w * 2]     = l;
+    ring[w * 2 + 1] = r;
+    writeIdx.store(next, std::memory_order_release);
+}
+
+void APU::step(int cycles) {
+    if (!powered) {
+        // Still produce silent samples to keep audio flowing.
+        sampleAccum += cycles;
+        const double period = static_cast<double>(CPU_FREQ) / SAMPLE_RATE;
+        while (sampleAccum >= period) {
+            sampleAccum -= period;
+            pushSample(0, 0);
+        }
+        return;
+    }
+
+    // Channel timers
+    tickSquare(ch1, cycles);
+    tickSquare(ch2, cycles);
+    tickWave(ch3, cycles);
+    tickNoise(ch4, cycles);
+
+    // Frame sequencer @ 512 Hz: every 8192 CPU cycles.
+    frameSeqCounter += cycles;
+    while (frameSeqCounter >= 8192) {
+        frameSeqCounter -= 8192;
+        stepFrameSequencer();
+    }
+
+    // Sampling
+    sampleAccum += cycles;
+    const double period = static_cast<double>(CPU_FREQ) / SAMPLE_RATE;
+    while (sampleAccum >= period) {
+        sampleAccum -= period;
+        produceSample();
+    }
+}
+
+void APU::stepFrameSequencer() {
+    switch (frameSeqStep) {
+        case 0: clockLength(); break;
+        case 1: break;
+        case 2: clockLength(); clockSweep(); break;
+        case 3: break;
+        case 4: clockLength(); break;
+        case 5: break;
+        case 6: clockLength(); clockSweep(); break;
+        case 7: clockEnvelope(); break;
+    }
+    frameSeqStep = (frameSeqStep + 1) & 7;
+}
+
+void APU::clockLength() {
+    auto clk = [](int& len, bool enabled, bool& ch) {
+        if (enabled && len > 0) {
+            if (--len == 0) ch = false;
+        }
+    };
+    clk(ch1.lengthCounter, ch1.lengthEnabled, ch1.enabled);
+    clk(ch2.lengthCounter, ch2.lengthEnabled, ch2.enabled);
+    clk(ch3.lengthCounter, ch3.lengthEnabled, ch3.enabled);
+    clk(ch4.lengthCounter, ch4.lengthEnabled, ch4.enabled);
+}
+
+void APU::clockEnvelope() {
+    auto env = [](int& counter, int period, int& vol, bool inc, bool enabled) {
+        if (!enabled || period == 0) return;
+        if (--counter <= 0) {
+            counter = period;
+            if (inc && vol < 15) vol++;
+            else if (!inc && vol > 0) vol--;
+        }
+    };
+    env(ch1.envCounter, ch1.envPeriod, ch1.volume, ch1.envIncreasing, ch1.enabled);
+    env(ch2.envCounter, ch2.envPeriod, ch2.volume, ch2.envIncreasing, ch2.enabled);
+    env(ch4.envCounter, ch4.envPeriod, ch4.volume, ch4.envIncreasing, ch4.enabled);
+}
+
+int APU::sweepCalc(bool& overflow) {
+    int shadow = ch1.sweepShadow;
+    int delta = shadow >> ch1.sweepShift;
+    int newF = ch1.sweepNegate ? (shadow - delta) : (shadow + delta);
+    if (ch1.sweepNegate) ch1.sweepNegCalcd = true;
+    overflow = (newF > 2047);
+    return newF;
+}
+
+void APU::clockSweep() {
+    if (!ch1.enabled) return;
+    if (--ch1.sweepCounter <= 0) {
+        ch1.sweepCounter = ch1.sweepPeriod ? ch1.sweepPeriod : 8;
+        if (ch1.sweepEnabled && ch1.sweepPeriod > 0) {
+            bool ov;
+            int newF = sweepCalc(ov);
+            if (ov) {
+                ch1.enabled = false;
+            } else if (ch1.sweepShift > 0) {
+                ch1.sweepShadow = newF;
+                ch1.frequency = newF;
+                bool ov2;
+                sweepCalc(ov2);
+                if (ov2) ch1.enabled = false;
+            }
+        }
+    }
+}
+
+void APU::tickSquare(Square& c, int cycles) {
+    if (!c.enabled) return;
+    c.freqTimer -= cycles;
+    while (c.freqTimer <= 0) {
+        int period = (2048 - c.frequency) * 4;
+        if (period <= 0) period = 1;
+        c.freqTimer += period;
+        c.dutyPos = (c.dutyPos + 1) & 7;
+    }
+}
+
+void APU::tickWave(Wave& c, int cycles) {
+    if (!c.enabled) return;
+    c.freqTimer -= cycles;
+    while (c.freqTimer <= 0) {
+        int period = (2048 - c.frequency) * 2;
+        if (period <= 0) period = 1;
+        c.freqTimer += period;
+        c.wavePos = (c.wavePos + 1) & 31;
+        uint8_t byte = c.waveRAM[c.wavePos >> 1];
+        c.sampleBuffer = (c.wavePos & 1) ? (byte & 0x0F) : (byte >> 4);
+    }
+}
+
+void APU::tickNoise(Noise& c, int cycles) {
+    if (!c.enabled) return;
+    c.freqTimer -= cycles;
+    while (c.freqTimer <= 0) {
+        int period = NOISE_DIVISORS[c.divisorCode] << c.shift;
+        if (period <= 0) period = 1;
+        c.freqTimer += period;
+        uint16_t bit = ((c.lfsr ^ (c.lfsr >> 1)) & 1);
+        c.lfsr >>= 1;
+        c.lfsr |= bit << 14;
+        if (c.widthMode) {
+            c.lfsr = (c.lfsr & ~(1 << 6)) | (bit << 6);
+        }
+    }
+}
+
+int APU::squareOutput(const Square& c) const {
+    if (!c.enabled || !c.dacOn) return 0;
+    int sample = (DUTY_TABLE[c.duty] >> (7 - c.dutyPos)) & 1;
+    return sample * c.volume;
+}
+
+int APU::waveOutput(const Wave& c) const {
+    if (!c.enabled || !c.dacOn) return 0;
+    int sample = c.sampleBuffer;
+    switch (c.volumeCode) {
+        case 0: return 0;
+        case 1: return sample;
+        case 2: return sample >> 1;
+        case 3: return sample >> 2;
+    }
+    return 0;
+}
+
+int APU::noiseOutput(const Noise& c) const {
+    if (!c.enabled || !c.dacOn) return 0;
+    int sample = (~c.lfsr) & 1;
+    return sample * c.volume;
+}
+
+void APU::produceSample() {
+    int s1 = squareOutput(ch1);
+    int s2 = squareOutput(ch2);
+    int s3 = waveOutput(ch3);
+    int s4 = noiseOutput(ch4);
+
+    int left = 0, right = 0;
+    if (nr51 & 0x10) left  += s1;
+    if (nr51 & 0x20) left  += s2;
+    if (nr51 & 0x40) left  += s3;
+    if (nr51 & 0x80) left  += s4;
+    if (nr51 & 0x01) right += s1;
+    if (nr51 & 0x02) right += s2;
+    if (nr51 & 0x04) right += s3;
+    if (nr51 & 0x08) right += s4;
+
+    int leftVol  = ((nr50 >> 4) & 0x07) + 1;
+    int rightVol = (nr50 & 0x07) + 1;
+
+    // Each channel: 0..15. Sum 0..60. Center on 0, scale.
+    // Convert to signed centered around 0: subtract midline only if any channel is on?
+    // Standard approach: treat each sample as 0..15 (unsigned DAC), mix unsigned, then convert.
+    // We'll center: ((sample/15)*2 - 1) * volume * masterVol
+    // Approximate with fixed-point: amp ~= 2200 per channel max.
+    int amp = 380; // per-channel scale; 4 channels * 15 * 380 * 8 ~ 182400, fits in 16-bit signed if /4
+    int outL = left  * leftVol  * amp / 32;
+    int outR = right * rightVol * amp / 32;
+    if (muted) { outL = 0; outR = 0; }
+    // Clamp
+    if (outL >  32000) outL =  32000;
+    if (outL < -32000) outL = -32000;
+    if (outR >  32000) outR =  32000;
+    if (outR < -32000) outR = -32000;
+
+    pushSample(static_cast<int16_t>(outL), static_cast<int16_t>(outR));
+}
+
+void APU::triggerCh1() {
+    ch1.enabled = ch1.dacOn;
+    if (ch1.lengthCounter == 0) ch1.lengthCounter = 64;
+    ch1.freqTimer = (2048 - ch1.frequency) * 4;
+    ch1.envCounter = ch1.envPeriod ? ch1.envPeriod : 8;
+    ch1.volume = ch1.envInitVol;
+    ch1.sweepShadow = ch1.frequency;
+    ch1.sweepCounter = ch1.sweepPeriod ? ch1.sweepPeriod : 8;
+    ch1.sweepEnabled = (ch1.sweepPeriod != 0) || (ch1.sweepShift != 0);
+    ch1.sweepNegCalcd = false;
+    if (ch1.sweepShift > 0) {
+        bool ov;
+        sweepCalc(ov);
+        if (ov) ch1.enabled = false;
+    }
+}
+
+void APU::triggerCh2() {
+    ch2.enabled = ch2.dacOn;
+    if (ch2.lengthCounter == 0) ch2.lengthCounter = 64;
+    ch2.freqTimer = (2048 - ch2.frequency) * 4;
+    ch2.envCounter = ch2.envPeriod ? ch2.envPeriod : 8;
+    ch2.volume = ch2.envInitVol;
+}
+
+void APU::triggerCh3() {
+    ch3.enabled = ch3.dacOn;
+    if (ch3.lengthCounter == 0) ch3.lengthCounter = 256;
+    ch3.freqTimer = (2048 - ch3.frequency) * 2;
+    ch3.wavePos = 0;
+    ch3.sampleBuffer = 0;
+}
+
+void APU::triggerCh4() {
+    ch4.enabled = ch4.dacOn;
+    if (ch4.lengthCounter == 0) ch4.lengthCounter = 64;
+    ch4.lfsr = 0x7FFF;
+    int period = NOISE_DIVISORS[ch4.divisorCode] << ch4.shift;
+    ch4.freqTimer = period > 0 ? period : 1;
+    ch4.envCounter = ch4.envPeriod ? ch4.envPeriod : 8;
+    ch4.volume = ch4.envInitVol;
+}
+
+uint8_t APU::readRegister(uint8_t reg) const {
+    // Wave RAM is always readable.
+    if (reg >= 0x30 && reg <= 0x3F) {
+        return ch3.waveRAM[reg - 0x30];
+    }
+    switch (reg) {
+        case 0x10: { // NR10
+            uint8_t v = (ch1.sweepPeriod << 4) | (ch1.sweepNegate ? 0x08 : 0) | ch1.sweepShift;
+            return v | 0x80;
+        }
+        case 0x11: return (ch1.duty << 6) | 0x3F;
+        case 0x12: return (ch1.envInitVol << 4) | (ch1.envIncreasing ? 0x08 : 0) | ch1.envPeriod;
+        case 0x13: return 0xFF;
+        case 0x14: return (ch1.lengthEnabled ? 0x40 : 0) | 0xBF;
+
+        case 0x16: return (ch2.duty << 6) | 0x3F;
+        case 0x17: return (ch2.envInitVol << 4) | (ch2.envIncreasing ? 0x08 : 0) | ch2.envPeriod;
+        case 0x18: return 0xFF;
+        case 0x19: return (ch2.lengthEnabled ? 0x40 : 0) | 0xBF;
+
+        case 0x1A: return (ch3.dacOn ? 0x80 : 0) | 0x7F;
+        case 0x1B: return 0xFF;
+        case 0x1C: return (ch3.volumeCode << 5) | 0x9F;
+        case 0x1D: return 0xFF;
+        case 0x1E: return (ch3.lengthEnabled ? 0x40 : 0) | 0xBF;
+
+        case 0x20: return 0xFF;
+        case 0x21: return (ch4.envInitVol << 4) | (ch4.envIncreasing ? 0x08 : 0) | ch4.envPeriod;
+        case 0x22: return (ch4.shift << 4) | (ch4.widthMode ? 0x08 : 0) | ch4.divisorCode;
+        case 0x23: return (ch4.lengthEnabled ? 0x40 : 0) | 0xBF;
+
+        case 0x24: return nr50;
+        case 0x25: return nr51;
+        case 0x26: {
+            uint8_t v = 0x70;
+            if (powered)       v |= 0x80;
+            if (ch1.enabled)   v |= 0x01;
+            if (ch2.enabled)   v |= 0x02;
+            if (ch3.enabled)   v |= 0x04;
+            if (ch4.enabled)   v |= 0x08;
+            return v;
+        }
+    }
+    return 0xFF;
+}
+
+void APU::writeRegister(uint8_t reg, uint8_t val) {
+    if (reg >= 0x30 && reg <= 0x3F) {
+        ch3.waveRAM[reg - 0x30] = val;
+        return;
+    }
+    if (!powered && reg != 0x26 && !(reg >= 0x11 && reg <= 0x11) /* allow length on DMG */) {
+        // When powered off, only NR52 and length-load registers writable on DMG.
+        // For simplicity we still ignore most writes.
+        if (reg != 0x11 && reg != 0x16 && reg != 0x1B && reg != 0x20) return;
+    }
+
+    switch (reg) {
+        case 0x10:
+            ch1.sweepPeriod = (val >> 4) & 0x07;
+            ch1.sweepNegate = (val & 0x08) != 0;
+            ch1.sweepShift  = val & 0x07;
+            // If sweep was negate-calc'd and we clear negate, disable channel.
+            if (ch1.sweepNegCalcd && !ch1.sweepNegate) ch1.enabled = false;
+            break;
+        case 0x11:
+            ch1.duty = (val >> 6) & 0x03;
+            ch1.lengthCounter = 64 - (val & 0x3F);
+            break;
+        case 0x12:
+            ch1.envInitVol    = (val >> 4) & 0x0F;
+            ch1.envIncreasing = (val & 0x08) != 0;
+            ch1.envPeriod     = val & 0x07;
+            ch1.dacOn = (val & 0xF8) != 0;
+            if (!ch1.dacOn) ch1.enabled = false;
+            break;
+        case 0x13:
+            ch1.frequency = (ch1.frequency & 0x700) | val;
+            break;
+        case 0x14:
+            ch1.frequency = (ch1.frequency & 0xFF) | ((val & 0x07) << 8);
+            ch1.lengthEnabled = (val & 0x40) != 0;
+            if (val & 0x80) triggerCh1();
+            break;
+
+        case 0x16:
+            ch2.duty = (val >> 6) & 0x03;
+            ch2.lengthCounter = 64 - (val & 0x3F);
+            break;
+        case 0x17:
+            ch2.envInitVol    = (val >> 4) & 0x0F;
+            ch2.envIncreasing = (val & 0x08) != 0;
+            ch2.envPeriod     = val & 0x07;
+            ch2.dacOn = (val & 0xF8) != 0;
+            if (!ch2.dacOn) ch2.enabled = false;
+            break;
+        case 0x18:
+            ch2.frequency = (ch2.frequency & 0x700) | val;
+            break;
+        case 0x19:
+            ch2.frequency = (ch2.frequency & 0xFF) | ((val & 0x07) << 8);
+            ch2.lengthEnabled = (val & 0x40) != 0;
+            if (val & 0x80) triggerCh2();
+            break;
+
+        case 0x1A:
+            ch3.dacOn = (val & 0x80) != 0;
+            if (!ch3.dacOn) ch3.enabled = false;
+            break;
+        case 0x1B:
+            ch3.lengthCounter = 256 - val;
+            break;
+        case 0x1C:
+            ch3.volumeCode = (val >> 5) & 0x03;
+            break;
+        case 0x1D:
+            ch3.frequency = (ch3.frequency & 0x700) | val;
+            break;
+        case 0x1E:
+            ch3.frequency = (ch3.frequency & 0xFF) | ((val & 0x07) << 8);
+            ch3.lengthEnabled = (val & 0x40) != 0;
+            if (val & 0x80) triggerCh3();
+            break;
+
+        case 0x20:
+            ch4.lengthCounter = 64 - (val & 0x3F);
+            break;
+        case 0x21:
+            ch4.envInitVol    = (val >> 4) & 0x0F;
+            ch4.envIncreasing = (val & 0x08) != 0;
+            ch4.envPeriod     = val & 0x07;
+            ch4.dacOn = (val & 0xF8) != 0;
+            if (!ch4.dacOn) ch4.enabled = false;
+            break;
+        case 0x22:
+            ch4.shift       = (val >> 4) & 0x0F;
+            ch4.widthMode   = (val & 0x08) != 0;
+            ch4.divisorCode = val & 0x07;
+            break;
+        case 0x23:
+            ch4.lengthEnabled = (val & 0x40) != 0;
+            if (val & 0x80) triggerCh4();
+            break;
+
+        case 0x24: nr50 = val; break;
+        case 0x25: nr51 = val; break;
+        case 0x26: {
+            bool wasPowered = powered;
+            powered = (val & 0x80) != 0;
+            if (wasPowered && !powered) {
+                // Clear all registers (DMG behavior: clear all except wave RAM, length on DMG).
+                for (uint8_t r = 0x10; r <= 0x25; ++r) {
+                    writeRegister(r, 0);
+                }
+                ch1 = Square{};
+                ch2 = Square{};
+                ch3.enabled = false;
+                ch3.dacOn = false;
+                ch3.volumeCode = 0;
+                ch3.lengthEnabled = false;
+                ch3.frequency = 0;
+                ch4 = Noise{};
+                ch4.lfsr = 0x7FFF;
+                nr50 = 0;
+                nr51 = 0;
+            } else if (!wasPowered && powered) {
+                frameSeqStep = 0;
+                ch1.dutyPos = 0;
+                ch2.dutyPos = 0;
+                ch3.wavePos = 0;
+            }
+            break;
         }
     }
 }

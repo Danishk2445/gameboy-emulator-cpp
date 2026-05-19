@@ -1,146 +1,133 @@
 #pragma once
 
 #include <cstdint>
-#include <array>
 #include <atomic>
+#include <iosfwd>
 #include <SDL.h>
 
 class Memory;
 
 class APU {
 public:
-    APU();
+    explicit APU(Memory& mem);
     ~APU();
-    
-    // Initialize SDL audio
+
     bool init();
-    
-    // Step APU by given number of CPU cycles
-    void step(int cycles);
-    
-    // Register write
-    void writeRegister(uint8_t reg, uint8_t val);
-    uint8_t readRegister(uint8_t reg) const;
-    
-    // Reset APU state
     void reset();
-    
+    void step(int cycles);
+
+    uint8_t readRegister(uint8_t reg) const;
+    void    writeRegister(uint8_t reg, uint8_t val);
+
+    void setMuted(bool m) { muted = m; }
+    bool isMuted() const  { return muted; }
+
+    void saveState(std::ostream& out) const;
+    bool loadState(std::istream& in);
+
 private:
-    // Audio device
-    SDL_AudioDeviceID audioDevice;
-    static constexpr int SAMPLE_RATE = 48000;
-    static constexpr int BUFFER_SIZE = 4096;
-    static constexpr int CPU_CLOCK = 4194304;
-    
-    // Sound registers (0xFF10-0xFF3F)
-    std::array<uint8_t, 0x30> registers;
-    
-    // Channel state
-    struct Channel1 {
-        bool enabled;
-        int frequencyTimer;
-        int frequency;
-        int duty;
-        int dutyPos;
-        int volume;
-        int volumeInit;
-        int envelopeTimer;
-        int envelopePeriod;
-        bool envelopeAdd;
-        int lengthCounter;
-        bool lengthEnabled;
-        int sweepTimer;
-        int sweepPeriod;
-        bool sweepNegate;
-        int sweepShift;
-        int shadowFreq;
-        bool sweepEnabled;
-    } ch1;
-    
-    struct Channel2 {
-        bool enabled;
-        int frequencyTimer;
-        int frequency;
-        int duty;
-        int dutyPos;
-        int volume;
-        int volumeInit;
-        int envelopeTimer;
-        int envelopePeriod;
-        bool envelopeAdd;
-        int lengthCounter;
-        bool lengthEnabled;
-    } ch2;
-    
-    struct Channel3 {
-        bool enabled;
-        bool dacEnabled;
-        int frequencyTimer;
-        int frequency;
-        int volume;
-        int lengthCounter;
-        bool lengthEnabled;
-        int samplePos;
-    } ch3;
-    
-    struct Channel4 {
-        bool enabled;
-        int frequencyTimer;
-        int volume;
-        int volumeInit;
-        int envelopeTimer;
-        int envelopePeriod;
-        bool envelopeAdd;
-        int lengthCounter;
-        bool lengthEnabled;
-        uint16_t lfsr;
-        int divisor;
-        int shift;
-        bool widthMode;
-    } ch4;
-    
-    // Wave RAM (0xFF30-0xFF3F)
-    std::array<uint8_t, 16> waveRam;
-    
-    // Frame sequencer
-    int frameSequencerCycles;
-    int frameSequencerStep;
-    
-    // Ring buffer for audio samples
-    std::array<float, BUFFER_SIZE * 2> ringBuffer;
-    std::atomic<int> writePos;
-    std::atomic<int> readPos;
-    
-    // Sample accumulator for proper timing
-    int sampleAccumulator;
-    static constexpr int SAMPLES_PER_FRAME = CPU_CLOCK / SAMPLE_RATE;
-    
-    // Master control
-    bool masterEnable;
-    uint8_t masterVolume;
-    uint8_t channelPan;  // NR51
-    
-    // Duty cycle patterns
-    static constexpr uint8_t dutyPatterns[4] = {
-        0b00000001,  // 12.5%
-        0b10000001,  // 25%
-        0b10000111,  // 50%
-        0b01111110   // 75%
+    Memory& memory;
+
+    SDL_AudioDeviceID device = 0;
+
+    static constexpr int  SAMPLE_RATE   = 44100;
+    static constexpr int  CPU_FREQ      = 4194304;
+    static constexpr int  BUFFER_FRAMES = 4096;
+
+    int16_t ring[BUFFER_FRAMES * 2]{};
+    std::atomic<int> writeIdx{0};
+    std::atomic<int> readIdx{0};
+
+    int   frameSeqCounter = 0;
+    int   frameSeqStep    = 0;
+    double sampleAccum    = 0.0;
+
+    bool powered = true;
+
+    struct Square {
+        bool    enabled       = false;
+        bool    dacOn         = false;
+        uint8_t duty          = 0;
+        int     dutyPos       = 0;
+        int     freqTimer     = 0;
+        int     frequency     = 0;   // 11-bit
+        int     lengthCounter = 0;
+        bool    lengthEnabled = false;
+        int     volume        = 0;
+        int     envInitVol    = 0;
+        bool    envIncreasing = false;
+        int     envPeriod     = 0;
+        int     envCounter    = 0;
+        // sweep (ch1 only)
+        int     sweepPeriod   = 0;
+        int     sweepShift    = 0;
+        bool    sweepNegate   = false;
+        int     sweepCounter  = 0;
+        int     sweepShadow   = 0;
+        bool    sweepEnabled  = false;
+        bool    sweepNegCalcd = false;
     };
-    
+
+    struct Wave {
+        bool    enabled       = false;
+        bool    dacOn         = false;
+        int     lengthCounter = 0;
+        bool    lengthEnabled = false;
+        int     freqTimer     = 0;
+        int     frequency     = 0;
+        int     volumeCode    = 0;
+        int     wavePos       = 0;
+        uint8_t sampleBuffer  = 0;
+        uint8_t waveRAM[16]{};
+    };
+
+    struct Noise {
+        bool    enabled       = false;
+        bool    dacOn         = false;
+        int     lengthCounter = 0;
+        bool    lengthEnabled = false;
+        int     freqTimer     = 0;
+        int     divisorCode   = 0;
+        int     shift         = 0;
+        bool    widthMode     = false;
+        uint16_t lfsr         = 0x7FFF;
+        int     volume        = 0;
+        int     envInitVol    = 0;
+        bool    envIncreasing = false;
+        int     envPeriod     = 0;
+        int     envCounter    = 0;
+    };
+
+    Square ch1{};
+    Square ch2{};
+    Wave   ch3{};
+    Noise  ch4{};
+
+    uint8_t nr50 = 0;
+    uint8_t nr51 = 0;
+    bool muted = false;
+
     void stepFrameSequencer();
-    void stepChannels();
-    void generateSample();
-    
-    void triggerChannel1();
-    void triggerChannel2();
-    void triggerChannel3();
-    void triggerChannel4();
-    
-    float getChannel1Output();
-    float getChannel2Output();
-    float getChannel3Output();
-    float getChannel4Output();
-    
+    void clockLength();
+    void clockEnvelope();
+    void clockSweep();
+
+    void tickSquare(Square& c, int cycles);
+    void tickWave(Wave& c, int cycles);
+    void tickNoise(Noise& c, int cycles);
+
+    int  sweepCalc(bool& overflow);
+    void triggerCh1();
+    void triggerCh2();
+    void triggerCh3();
+    void triggerCh4();
+
+    int squareOutput(const Square& c) const;
+    int waveOutput(const Wave& c) const;
+    int noiseOutput(const Noise& c) const;
+
+    void produceSample();
+    void pushSample(int16_t l, int16_t r);
+
     static void audioCallback(void* userdata, Uint8* stream, int len);
 };

@@ -2,34 +2,38 @@
 #include <iostream>
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <rom.gb>" << std::endl;
-        return 1;
-    }
-    
     GameBoy gb;
-    
     if (!gb.init()) {
-        std::cerr << "Failed to initialize emulator" << std::endl;
+        std::cerr << "Failed to initialize emulator\n";
         return 1;
     }
-    
-    if (!gb.loadROM(argv[1])) {
-        std::cerr << "Failed to load ROM: " << argv[1] << std::endl;
-        return 1;
+
+    if (argc >= 2) {
+        if (!gb.loadROM(argv[1])) {
+            std::cerr << "Failed to load ROM: " << argv[1]
+                      << " — opening menu.\n";
+        }
     }
-    
-    std::cout << "Starting emulation..." << std::endl;
-    std::cout << "Controls:" << std::endl;
-    std::cout << "  Arrow keys - D-Pad" << std::endl;
-    std::cout << "  Z - A button" << std::endl;
-    std::cout << "  X - B button" << std::endl;
-    std::cout << "  Enter - Start" << std::endl;
-    std::cout << "  Backspace - Select" << std::endl;
-    std::cout << "  Escape - Quit" << std::endl;
-    
+
+    std::cout <<
+        "Controls:\n"
+        "  Arrows      D-Pad\n"
+        "  Z / X       A / B\n"
+        "  Enter       Start\n"
+        "  Backspace   Select\n"
+        "Hotkeys (RetroArch style):\n"
+        "  F1          Menu / Pause overlay\n"
+        "  F2          Save state (current slot)\n"
+        "  F4          Load state (current slot)\n"
+        "  F6 / F7     Slot -1 / +1\n"
+        "  F8          Screenshot\n"
+        "  F9          Reset\n"
+        "  F11         Fullscreen toggle\n"
+        "  P           Pause toggle\n"
+        "  Space       Fast-forward (hold)\n"
+        "  M           Mute toggle\n"
+        "  Esc         Open menu\n";
+
     gb.run();
-    
-    SDL_Quit();
     return 0;
 }
