@@ -1,3 +1,9 @@
+
+
+<img width="641" height="601" alt="Screenshot_20260519_105801" src="https://github.com/user-attachments/assets/4a1201bf-0a4e-4d33-8b3a-3977e8cc9778" />
+<img width="636" height="600" alt="Screenshot_20260519_105719" src="https://github.com/user-attachments/assets/b01ca965-0f6b-43fb-ad69-bc487db7c3dc" />
+<img width="642" height="605" alt="Screenshot_20260519_105658" src="https://github.com/user-attachments/assets/402f24b1-4c24-4a9f-bef1-e5b713aae93e" />
+
 # Game Boy Emulator
 
 A Game Boy (DMG) emulator written in C++ using SDL2 for video, input, and audio.
