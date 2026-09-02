@@ -15,7 +15,7 @@
 
 namespace {
 constexpr uint32_t kStateMagic   = 0x53574247u; // 'GBWS' (Game Boy Write State)
-constexpr uint32_t kStateVersion = 1;
+constexpr uint32_t kStateVersion = 2;
 
 constexpr uint32_t PALETTES[][4] = {
     // 0: GREEN (DMG classic)

@@ -37,6 +37,7 @@ private:
     bool imeScheduled = false;
     bool halted = false;
     bool stopped = false;
+    bool haltBug = false;
 
     bool getZ() const { return (f & 0x80) != 0; }
     bool getN() const { return (f & 0x40) != 0; }

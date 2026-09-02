@@ -8,7 +8,7 @@
 namespace {
 struct CpuStateBlob {
     uint16_t af, bc, de, hl, sp, pc;
-    uint8_t ime, imeScheduled, halted, stopped;
+    uint8_t ime, imeScheduled, halted, stopped, haltBug;
 };
 }
 
@@ -19,6 +19,7 @@ void CPU::saveState(std::ostream& out) const {
     s.imeScheduled = imeScheduled ? 1 : 0;
     s.halted = halted ? 1 : 0;
     s.stopped = stopped ? 1 : 0;
+    s.haltBug = haltBug ? 1 : 0;
     out.write(reinterpret_cast<const char*>(&s), sizeof(s));
 }
 
@@ -30,6 +31,7 @@ bool CPU::loadState(std::istream& in) {
     imeScheduled = s.imeScheduled != 0;
     halted = s.halted != 0;
     stopped = s.stopped != 0;
+    haltBug = s.haltBug != 0;
     return true;
 }
 
@@ -46,6 +48,7 @@ void CPU::reset() {
     imeScheduled = false;
     halted = false;
     stopped = false;
+    haltBug = false;
 }
 
 void CPU::requestInterrupt(uint8_t mask) {
@@ -209,6 +212,10 @@ int CPU::step() {
 
     bool wasImeScheduled = imeScheduled;
     uint8_t op = fetch8();
+    if (haltBug) {
+        pc--;           // opcode fetched, but PC did not advance
+        haltBug = false;
+    }
     int cycles = execute(op);
     if (wasImeScheduled && imeScheduled) {
         ime = true;
@@ -247,7 +254,17 @@ int CPU::execute(uint8_t op) {
 
     // 0x40-0x7F: LD r,r (0x76 = HALT)
     if (op >= 0x40 && op <= 0x7F) {
-        if (op == 0x76) { halted = true; return 4; }
+        if (op == 0x76) {
+            // HALT with IME=0 and an interrupt already pending does not halt;
+            // instead the CPU fails to increment PC on the next opcode fetch,
+            // so the byte after HALT is read twice (the DMG "halt bug").
+            if (!ime && (memory.getIF() & memory.getIE() & 0x1F) != 0) {
+                haltBug = true;
+            } else {
+                halted = true;
+            }
+            return 4;
+        }
         int dst = (op >> 3) & 0x07;
         int src = op & 0x07;
         wrR(dst, rdR(src));
