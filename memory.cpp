@@ -123,7 +123,8 @@ void Memory::unloadROM() {
     ramEnabled = false; mbc1RamMode = false; rtcRegister = 0;
     hasBattery = false; sramDirty = false;
     savePath.clear(); loadedPath.clear();
-    divCounter = 0; timerCounter = 0;
+    divCounter = 0; prevDivCounter = 0;
+    timerSignal = false; timaReloading = false; timaJustReloaded = false;
     dmaActive = false; dmaCycles = 0; dmaSource = 0;
     joypadButtons = 0x0F; joypadDpad = 0x0F;
 }
@@ -158,7 +159,9 @@ void Memory::saveState(std::ostream& out) const {
     uint8_t flags = (ramEnabled ? 1 : 0) | (mbc1RamMode ? 2 : 0);
     W(flags);
     W(rtcRegister);
-    W(divCounter); W(timerCounter);
+    W(divCounter);
+    uint8_t timerFlags = (timerSignal ? 1 : 0) | (timaReloading ? 2 : 0);
+    W(timerFlags);
     uint8_t dma = dmaActive ? 1 : 0;
     W(dma); W(dmaCycles); W(dmaSource);
     W(joypadButtons); W(joypadDpad);
@@ -192,7 +195,11 @@ bool Memory::loadState(std::istream& in) {
     ramEnabled  = (flags & 1) != 0;
     mbc1RamMode = (flags & 2) != 0;
     if (!R(rtcRegister)) return false;
-    if (!R(divCounter) || !R(timerCounter)) return false;
+    if (!R(divCounter)) return false;
+    uint8_t timerFlags = 0;
+    if (!R(timerFlags)) return false;
+    timerSignal   = (timerFlags & 1) != 0;
+    timaReloading = (timerFlags & 2) != 0;
     uint8_t dma = 0;
     if (!R(dma) || !R(dmaCycles) || !R(dmaSource)) return false;
     dmaActive = dma != 0;
@@ -230,14 +237,17 @@ bool Memory::saveSRAM() const {
     return true;
 }
 
-int Memory::getTimerFrequency() const {
+// Which bit of the system counter TIMA watches, per TAC bits 0-1. Falling
+// edges of that bit are what drive TIMA, so the periods it produces are the
+// familiar 1024 / 16 / 64 / 256 T-cycles.
+int Memory::timerBit() const {
     switch (io[0x07] & 0x03) {
-        case 0: return 1024;
-        case 1: return 16;
-        case 2: return 64;
-        case 3: return 256;
+        case 0: return 9;
+        case 1: return 3;
+        case 2: return 5;
+        case 3: return 7;
     }
-    return 1024;
+    return 9;
 }
 
 void Memory::tick(int cycles) {
@@ -248,23 +258,42 @@ void Memory::tick(int cycles) {
 }
 
 void Memory::updateTimer(int cycles) {
-    divCounter += cycles;
-    while (divCounter >= 256) {
-        divCounter -= 256;
-        io[0x04]++;
-    }
-    if (io[0x07] & 0x04) {
-        timerCounter += cycles;
-        int freq = getTimerFrequency();
-        while (timerCounter >= freq) {
-            timerCounter -= freq;
-            if (io[0x05] == 0xFF) {
-                io[0x05] = io[0x06];
-                io[0x0F] |= INT_TIMER;
-            } else {
-                io[0x05]++;
-            }
+    // One M-cycle at a time: the fastest TAC setting ticks TIMA every 16
+    // T-cycles, so this never steps over an edge.
+    for (int i = 0; i < cycles; i += 4) {
+        timaJustReloaded = false;
+        if (timaReloading) {
+            io[0x05] = io[0x06];
+            io[0x0F] |= INT_TIMER;
+            timaReloading = false;
+            timaJustReloaded = true;
         }
+        prevDivCounter = divCounter;
+        setDivCounter(static_cast<uint16_t>(divCounter + 4));
+    }
+}
+
+void Memory::setDivCounter(uint16_t v) {
+    divCounter = v;
+    updateTimerEdge();
+}
+
+// TIMA is clocked by the falling edge of (selected counter bit AND timer
+// enable). Recomputing this after every counter, DIV or TAC change is what
+// gives the hardware's "spurious" increments for free.
+void Memory::updateTimerEdge() {
+    bool signal = (io[0x07] & 0x04) != 0 &&
+                  ((divCounter >> timerBit()) & 1) != 0;
+    if (timerSignal && !signal) incTIMA();
+    timerSignal = signal;
+}
+
+void Memory::incTIMA() {
+    if (io[0x05] == 0xFF) {
+        io[0x05] = 0;           // reads as 0 until the reload one M-cycle later
+        timaReloading = true;
+    } else {
+        io[0x05]++;
     }
 }
 
@@ -382,6 +411,7 @@ uint8_t Memory::read(uint16_t addr) const {
     if (addr < 0xFF80) {
         uint8_t reg = addr & 0x7F;
         if (reg == 0x00) return readJoypad();
+        if (reg == 0x04) return uint8_t(divCounter >> 8);
         if (reg == 0x41) {
             return ppu ? ppu->readSTAT() : io[0x41];
         }
@@ -442,13 +472,37 @@ void Memory::write(uint16_t addr, uint8_t val) {
                 io[0x00] = (io[0x00] & 0x0F) | (val & 0x30);
                 return;
             case 0x04:
-                io[0x04] = 0;
-                divCounter = 0;
+                // Any write clears the whole counter, which can drop the
+                // watched bit and tick TIMA on the way past.
+                setDivCounter(0);
                 return;
-            case 0x07:
-                if ((io[0x07] & 0x03) != (val & 0x03)) timerCounter = 0;
+            case 0x05:
+                // Writing TIMA during the post-overflow window aborts the
+                // pending TMA reload and its interrupt — but on the cycle the
+                // reload itself lands, the write is dropped instead.
+                if (!timaJustReloaded) {
+                    io[0x05] = val;
+                    timaReloading = false;
+                }
+                return;
+            case 0x06:
+                // A TMA write on the reload cycle is picked up by that reload.
+                io[0x06] = val;
+                if (timaJustReloaded) io[0x05] = val;
+                return;
+            case 0x07: {
                 io[0x07] = val | 0xF8;
+                // The write takes effect before the last T-cycle of this
+                // M-cycle, so enabling the timer just as the watched bit falls
+                // still produces the edge. Treat the signal as having been high
+                // if it was high either before or after the step we just took.
+                bool enabled = (io[0x07] & 0x04) != 0;
+                bool sigPrev = enabled && ((prevDivCounter >> timerBit()) & 1);
+                bool sigNow  = enabled && ((divCounter     >> timerBit()) & 1);
+                if ((timerSignal || sigPrev) && !sigNow) incTIMA();
+                timerSignal = sigNow;
                 return;
+            }
             case 0x0F:
                 io[0x0F] = val | 0xE0;
                 return;

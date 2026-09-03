@@ -75,8 +75,21 @@ private:
     bool hasBattery = false;
     mutable bool sramDirty = false;
 
-    int divCounter = 0;
-    int timerCounter = 0;
+    // Internal 16-bit system counter, incremented every T-cycle. DIV (FF04) is
+    // simply its top 8 bits, and TIMA counts *falling edges* of one of its bits
+    // (selected by TAC) — which is why writing DIV or TAC can tick the timer.
+    uint16_t divCounter = 0;
+    // Counter value before the current M-cycle's step, needed because a TAC
+    // write lands partway through the M-cycle: on hardware the new TAC is
+    // already in effect for the counter transition we have just stepped over.
+    uint16_t prevDivCounter = 0;
+    bool timerSignal = false;
+    // An overflowed TIMA reads 0 for one M-cycle before TMA is loaded and the
+    // interrupt is raised; a write to TIMA inside that window cancels both.
+    bool timaReloading = false;
+    // True for the rest of the M-cycle in which the reload actually happened.
+    // On that cycle a TIMA write is ignored and a TMA write also lands in TIMA.
+    bool timaJustReloaded = false;
 
     bool dmaActive = false;
     int  dmaCycles = 0;
@@ -86,8 +99,11 @@ private:
     uint8_t joypadDpad    = 0x0F;
 
     void    updateTimer(int cycles);
+    void    setDivCounter(uint16_t v);
+    void    updateTimerEdge();
+    void    incTIMA();
     void    updateDMA(int cycles);
     uint8_t readJoypad() const;
     void    handleMBCWrite(uint16_t addr, uint8_t val);
-    int     getTimerFrequency() const;
+    int     timerBit() const;
 };
