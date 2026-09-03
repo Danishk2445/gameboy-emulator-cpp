@@ -51,6 +51,15 @@ private:
         f = (z ? 0x80 : 0) | (n ? 0x40 : 0) | (hf ? 0x20 : 0) | (cf ? 0x10 : 0);
     }
 
+    // T-cycles already ticked into the rest of the system by the instruction
+    // currently executing. step() tops this up to the instruction's full
+    // length before returning.
+    int instrCycles = 0;
+
+    void tick(int cycles);
+    void internalCycle() { tick(4); }
+    int  finish(int totalCycles);
+
     uint8_t  read8(uint16_t addr);
     void     write8(uint16_t addr, uint8_t val);
     uint16_t read16(uint16_t addr);

@@ -240,6 +240,13 @@ int Memory::getTimerFrequency() const {
     return 1024;
 }
 
+void Memory::tick(int cycles) {
+    updateTimer(cycles);
+    updateDMA(cycles);
+    if (ppu) ppu->step(cycles);
+    if (apu) apu->step(cycles);
+}
+
 void Memory::updateTimer(int cycles) {
     divCounter += cycles;
     while (divCounter >= 256) {

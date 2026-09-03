@@ -55,13 +55,28 @@ void CPU::requestInterrupt(uint8_t mask) {
     memory.setIF(memory.getIF() | mask);
 }
 
-uint8_t  CPU::read8(uint16_t a)        { return memory.read(a); }
-void     CPU::write8(uint16_t a, uint8_t v) { memory.write(a, v); }
+void CPU::tick(int cycles) {
+    instrCycles += cycles;
+    memory.tick(cycles);
+}
+
+// Every bus access occupies one M-cycle, and the value is sampled at the end
+// of it, so the rest of the system runs first and the access sees the state it
+// would see on hardware.
+uint8_t  CPU::read8(uint16_t a)        { tick(4); return memory.read(a); }
+void     CPU::write8(uint16_t a, uint8_t v) { tick(4); memory.write(a, v); }
 uint16_t CPU::read16(uint16_t a)       { return read8(a) | (uint16_t(read8(a + 1)) << 8); }
 void     CPU::write16(uint16_t a, uint16_t v) { write8(a, v & 0xFF); write8(a + 1, v >> 8); }
 uint8_t  CPU::fetch8()                 { return read8(pc++); }
 uint16_t CPU::fetch16()                { uint16_t v = read16(pc); pc += 2; return v; }
-void     CPU::push16(uint16_t v)       { sp -= 2; write16(sp, v); }
+
+// PUSH, CALL, RST and interrupt dispatch all spend one internal M-cycle on the
+// stack-pointer decrement before the two writes, and push the high byte first.
+void CPU::push16(uint16_t v) {
+    internalCycle();
+    write8(--sp, uint8_t(v >> 8));
+    write8(--sp, uint8_t(v & 0xFF));
+}
 uint16_t CPU::pop16()                  { uint16_t v = read16(sp); sp += 2; return v; }
 
 void CPU::add8(uint8_t v) {
@@ -189,7 +204,8 @@ int CPU::handleInterrupts() {
         if (pending & mask) {
             ime = false;
             memory.setIF(memory.getIF() & ~mask);
-            push16(pc);
+            internalCycle();    // dispatch spends two internal M-cycles before
+            push16(pc);         // the push; push16 accounts for the second
             pc = 0x0040 + i * 0x08;
             return 20;
         }
@@ -197,18 +213,29 @@ int CPU::handleInterrupts() {
     return 0;
 }
 
+// Pad out to the instruction's documented length. Anything not already ticked
+// by a bus access or an explicit internal cycle is trailing internal work, so
+// it lands at the end of the instruction — which is where it belongs.
+int CPU::finish(int totalCycles) {
+    int remaining = totalCycles - instrCycles;
+    if (remaining > 0) tick(remaining);
+    return totalCycles;
+}
+
 int CPU::step() {
+    instrCycles = 0;
+
     if (halted) {
         if ((memory.getIF() & memory.getIE() & 0x1F) != 0) {
             halted = false;
         } else {
             int c = handleInterrupts();
-            return c > 0 ? c : 4;
+            return finish(c > 0 ? c : 4);
         }
     }
 
     int ic = handleInterrupts();
-    if (ic > 0) return ic;
+    if (ic > 0) return finish(ic);
 
     bool wasImeScheduled = imeScheduled;
     uint8_t op = fetch8();
@@ -221,7 +248,7 @@ int CPU::step() {
         ime = true;
         imeScheduled = false;
     }
-    return cycles;
+    return finish(cycles);
 }
 
 int CPU::execute(uint8_t op) {
@@ -387,10 +414,11 @@ int CPU::execute(uint8_t op) {
 
         // RET / RET cc
         case 0xC9: pc = pop16(); return 16;
-        case 0xC0: if (!getZ()) { pc = pop16(); return 20; } return 8;
-        case 0xC8: if ( getZ()) { pc = pop16(); return 20; } return 8;
-        case 0xD0: if (!getC()) { pc = pop16(); return 20; } return 8;
-        case 0xD8: if ( getC()) { pc = pop16(); return 20; } return 8;
+        // RET cc spends an internal M-cycle testing the condition, taken or not.
+        case 0xC0: internalCycle(); if (!getZ()) { pc = pop16(); return 20; } return 8;
+        case 0xC8: internalCycle(); if ( getZ()) { pc = pop16(); return 20; } return 8;
+        case 0xD0: internalCycle(); if (!getC()) { pc = pop16(); return 20; } return 8;
+        case 0xD8: internalCycle(); if ( getC()) { pc = pop16(); return 20; } return 8;
         case 0xD9: pc = pop16(); ime = true; return 16; // RETI
 
         // POP / PUSH

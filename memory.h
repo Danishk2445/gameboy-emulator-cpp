@@ -34,8 +34,11 @@ public:
 
     void setJoypadState(uint8_t buttons, uint8_t dpad);
 
-    void updateTimer(int cycles);
-    void updateDMA(int cycles);
+    // Advance timer, DMA, PPU and APU by `cycles` T-cycles. The CPU calls this
+    // from inside each instruction (once per memory access / internal cycle),
+    // so peripherals stay in step with the bus rather than lurching forward a
+    // whole instruction at a time.
+    void tick(int cycles);
 
     uint8_t getIF() const { return io[0x0F]; }
     void    setIF(uint8_t v) { io[0x0F] = v; }
@@ -82,6 +85,8 @@ private:
     uint8_t joypadButtons = 0x0F;
     uint8_t joypadDpad    = 0x0F;
 
+    void    updateTimer(int cycles);
+    void    updateDMA(int cycles);
     uint8_t readJoypad() const;
     void    handleMBCWrite(uint16_t addr, uint8_t val);
     int     getTimerFrequency() const;

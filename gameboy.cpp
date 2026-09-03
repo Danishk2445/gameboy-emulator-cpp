@@ -361,12 +361,9 @@ void GameBoy::applyUIAction() {
 void GameBoy::runOneFrame() {
     int frameCycles = 0;
     while (frameCycles < CYCLES_PER_FRAME && running) {
-        int c = cpu->step();
-        memory->updateTimer(c);
-        memory->updateDMA(c);
-        ppu->step(c);
-        apu->step(c);
-        frameCycles += c;
+        // cpu->step() already advanced the timer, DMA, PPU and APU as it went,
+        // one M-cycle at a time, so only the frame budget is left to track.
+        frameCycles += cpu->step();
         if (ppu->isFrameReady()) {
             ppu->clearFrameReady();
         }
