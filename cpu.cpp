@@ -63,21 +63,45 @@ void CPU::tick(int cycles) {
 // Every bus access occupies one M-cycle, and the value is sampled at the end
 // of it, so the rest of the system runs first and the access sees the state it
 // would see on hardware.
-uint8_t  CPU::read8(uint16_t a)        { tick(4); return memory.read(a); }
-void     CPU::write8(uint16_t a, uint8_t v) { tick(4); memory.write(a, v); }
+uint8_t  CPU::read8(uint16_t a)        { tick(4); memory.oamBugAccess(a, OamBugOp::Read); return memory.read(a); }
+void     CPU::write8(uint16_t a, uint8_t v) { tick(4); memory.oamBugAccess(a, OamBugOp::Write); memory.write(a, v); }
 uint16_t CPU::read16(uint16_t a)       { return read8(a) | (uint16_t(read8(a + 1)) << 8); }
 void     CPU::write16(uint16_t a, uint16_t v) { write8(a, v & 0xFF); write8(a + 1, v >> 8); }
 uint8_t  CPU::fetch8()                 { return read8(pc++); }
 uint16_t CPU::fetch16()                { uint16_t v = read16(pc); pc += 2; return v; }
 
+// The 16-bit increment/decrement unit is wired straight to the address bus, so
+// bumping a register that happens to point into OAM looks to the PPU like a
+// write there even though nothing is stored. Call with the value *before* the
+// adjustment — that is what gets driven onto the bus.
+void CPU::idu(uint16_t before) { memory.oamBugAccess(before, OamBugOp::Write); }
+
+// A read whose M-cycle is shared with an IDU adjustment, as in LD A,(HL+).
+uint8_t CPU::readIdu8(uint16_t a) {
+    tick(4);
+    memory.oamBugAccess(a, OamBugOp::ReadWrite);
+    return memory.read(a);
+}
+
 // PUSH, CALL, RST and interrupt dispatch all spend one internal M-cycle on the
 // stack-pointer decrement before the two writes, and push the high byte first.
+// Both decrements run through the IDU: the first during the internal cycle, the
+// second alongside the high byte's write, where a real and a glitched write in
+// one M-cycle collapse into a plain write — so only the first needs a call.
 void CPU::push16(uint16_t v) {
     internalCycle();
+    idu(sp);
     write8(--sp, uint8_t(v >> 8));
     write8(--sp, uint8_t(v & 0xFF));
 }
-uint16_t CPU::pop16()                  { uint16_t v = read16(sp); sp += 2; return v; }
+
+// The first increment shares the low byte's M-cycle, putting a read and a
+// glitched write on the bus together; the second produces no write at all.
+uint16_t CPU::pop16() {
+    uint8_t lo = readIdu8(sp++);
+    uint8_t hi = read8(sp++);
+    return uint16_t(lo | (uint16_t(hi) << 8));
+}
 
 void CPU::add8(uint8_t v) {
     uint16_t r = a + v;
@@ -329,25 +353,32 @@ int CPU::execute(uint8_t op) {
         // LD (rr),A / LD A,(rr) / LD (HL+/-),A / LD A,(HL+/-)
         case 0x02: write8(bc, a); return 8;
         case 0x12: write8(de, a); return 8;
+        // The pointer bump shares the access M-cycle. For a store that means a
+        // real write and a glitched one together, which behaves as a single
+        // write — so write8's own trigger already covers it.
         case 0x22: write8(hl++, a); return 8;
         case 0x32: write8(hl--, a); return 8;
         case 0x0A: a = read8(bc); return 8;
         case 0x1A: a = read8(de); return 8;
-        case 0x2A: a = read8(hl++); return 8;
-        case 0x3A: a = read8(hl--); return 8;
+        // A load, though, is a read and a glitched write in one M-cycle.
+        case 0x2A: a = readIdu8(hl++); return 8;
+        case 0x3A: a = readIdu8(hl--); return 8;
 
         // LD (nn),SP
         case 0x08: { uint16_t addr = fetch16(); write16(addr, sp); return 20; }
 
         // INC rr / DEC rr (no flags)
-        case 0x03: bc++; return 8;
-        case 0x13: de++; return 8;
-        case 0x23: hl++; return 8;
-        case 0x33: sp++; return 8;
-        case 0x0B: bc--; return 8;
-        case 0x1B: de--; return 8;
-        case 0x2B: hl--; return 8;
-        case 0x3B: sp--; return 8;
+        // The adjustment happens in the instruction's second M-cycle, so tick
+        // it before running the IDU — the OAM row it corrupts depends on where
+        // in the scan that M-cycle lands.
+        case 0x03: internalCycle(); idu(bc); bc++; return 8;
+        case 0x13: internalCycle(); idu(de); de++; return 8;
+        case 0x23: internalCycle(); idu(hl); hl++; return 8;
+        case 0x33: internalCycle(); idu(sp); sp++; return 8;
+        case 0x0B: internalCycle(); idu(bc); bc--; return 8;
+        case 0x1B: internalCycle(); idu(de); de--; return 8;
+        case 0x2B: internalCycle(); idu(hl); hl--; return 8;
+        case 0x3B: internalCycle(); idu(sp); sp--; return 8;
 
         // INC r / DEC r and immediates handled by pattern:
         case 0x04: b = inc8(b); return 4;

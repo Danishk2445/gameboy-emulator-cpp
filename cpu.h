@@ -62,6 +62,8 @@ private:
 
     uint8_t  read8(uint16_t addr);
     void     write8(uint16_t addr, uint8_t val);
+    uint8_t  readIdu8(uint16_t addr);
+    void     idu(uint16_t before);
     uint16_t read16(uint16_t addr);
     void     write16(uint16_t addr, uint16_t val);
     uint8_t  fetch8();

@@ -14,6 +14,8 @@ struct PpuStateBlob {
     uint8_t frameReady;
     int32_t windowLine;
     uint8_t prevStatLine;
+    uint8_t scanActive;
+    int32_t scanRow;
 };
 }
 
@@ -25,6 +27,8 @@ void PPU::saveState(std::ostream& out) const {
     s.frameReady = frameReady ? 1 : 0;
     s.windowLine = windowLine;
     s.prevStatLine = prevStatLine ? 1 : 0;
+    s.scanActive = scanActive ? 1 : 0;
+    s.scanRow = scanRow;
     out.write(reinterpret_cast<const char*>(&s), sizeof(s));
     out.write(reinterpret_cast<const char*>(framebuffer.data()),
               framebuffer.size() * sizeof(uint32_t));
@@ -43,6 +47,8 @@ bool PPU::loadState(std::istream& in) {
     frameReady = s.frameReady != 0;
     windowLine = s.windowLine;
     prevStatLine = s.prevStatLine != 0;
+    scanActive = s.scanActive != 0;
+    scanRow = s.scanRow;
     if (!in.read(reinterpret_cast<char*>(framebuffer.data()),
                  framebuffer.size() * sizeof(uint32_t))) return false;
     return true;
@@ -59,6 +65,8 @@ void PPU::reset() {
     frameReady = false;
     windowLine = 0;
     prevStatLine = false;
+    scanActive = false;
+    scanRow = 0;
     framebuffer.fill(shades[0]);
 }
 
@@ -74,6 +82,21 @@ void PPU::writeLCDC(uint8_t v) {
         memory.writeIO(0x41, stat);
         memory.writeIO(0x44, 0);
         windowLine = 0;
+        scanActive = false;
+    } else if (!wasOn && isOn) {
+        // Switching the LCD back on restarts at the top of a visible scanline,
+        // so LY does not reach 1 until nearly a whole line later. Without this
+        // the PPU would resume part-way through a line and everything measured
+        // from the LCDC write — LY, the OAM scan — would be off.
+        ly = 0;
+        // The scanline starts at the top of the M-cycle carrying this write,
+        // which is already 4 cycles gone by the time the write lands — so the
+        // PPU is one M-cycle into the OAM scan, not zero.
+        scanlineCycles = 4;
+        windowLine = 0;
+        prevStatLine = false;
+        memory.writeIO(0x44, 0);
+        setMode(2);
     }
 }
 
@@ -111,8 +134,21 @@ void PPU::updateStatLine() {
 void PPU::step(int cycles) {
     lcdc = memory.readIO(0x40);
     if ((lcdc & 0x80) == 0) {
+        scanActive = false;
         return;
     }
+
+    // Sampled before the counter advances, so it describes the M-cycle now
+    // elapsing rather than the next one. The CPU reads it back after tick().
+    //
+    // The scan runs one M-cycle ahead of the mode-2 window: it already starts
+    // in the M-cycle where LY advances and the mode flips, which is the same
+    // one-cycle lead that makes LY read as updated 113 M-cycles after the LCD
+    // is switched on. So this window covers rows 1-19, and row 0 falls in the
+    // transition cycle itself — invisible either way, since row 0 holds objects
+    // 0 and 1 and hardware never corrupts it.
+    scanActive = (mode == 2);
+    scanRow = scanlineCycles / 4 + 1;
 
     scanlineCycles += cycles;
 

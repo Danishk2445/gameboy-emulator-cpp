@@ -26,6 +26,13 @@ public:
     uint8_t readSTAT() const;
     uint8_t readLY()   const { return ly; }
 
+    // During mode 2 the PPU walks OAM one 8-byte row per M-cycle. These report
+    // whether the M-cycle that just elapsed overlapped that scan and which of
+    // the 20 rows it read — the CPU needs both for the DMG OAM corruption bug.
+    // The row can come back as 20, one past the end; callers ignore it.
+    bool oamScanActive() const { return scanActive; }
+    int  oamScanRow()    const { return scanRow; }
+
     void saveState(std::ostream& out) const;
     bool loadState(std::istream& in);
 
@@ -43,6 +50,8 @@ private:
     bool frameReady = false;
     int  windowLine = 0;
     bool prevStatLine = false;
+    bool scanActive = false;
+    int  scanRow = 0;
 
     std::array<uint32_t, SCREEN_WIDTH * SCREEN_HEIGHT> framebuffer{};
 

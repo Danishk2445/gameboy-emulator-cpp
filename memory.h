@@ -9,6 +9,11 @@ class PPU;
 class CPU;
 class APU;
 
+// What the CPU drove onto the bus during an M-cycle, for the purposes of the
+// DMG OAM corruption bug. ReadWrite is a read sharing its M-cycle with a
+// 16-bit increment/decrement, which corrupts differently from either alone.
+enum class OamBugOp { Read, Write, ReadWrite };
+
 class Memory {
 public:
     Memory();
@@ -39,6 +44,13 @@ public:
     // so peripherals stay in step with the bus rather than lurching forward a
     // whole instruction at a time.
     void tick(int cycles);
+
+    // The DMG OAM corruption bug: any CPU bus activity aimed at $FE00-$FEFF
+    // while the PPU is scanning OAM scrambles the row it is reading. The CPU
+    // calls this for real accesses and for the address its 16-bit
+    // increment/decrement unit puts on the bus. Addresses outside OAM and
+    // M-cycles outside the scan are ignored, so callers need not check.
+    void oamBugAccess(uint16_t addr, OamBugOp op);
 
     uint8_t getIF() const { return io[0x0F]; }
     void    setIF(uint8_t v) { io[0x0F] = v; }
@@ -106,4 +118,12 @@ private:
     uint8_t readJoypad() const;
     void    handleMBCWrite(uint16_t addr, uint8_t val);
     int     timerBit() const;
+
+    // OAM is 20 rows of four 16-bit words, and the corruption works on whole
+    // words because that is how wide the OAM data bus is.
+    uint16_t oamWord(int row, int word) const;
+    void     setOamWord(int row, int word, uint16_t v);
+    void     oamCorruptRead(int row);
+    void     oamCorruptWrite(int row);
+    void     oamCorruptReadWrite(int row);
 };

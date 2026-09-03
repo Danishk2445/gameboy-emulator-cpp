@@ -251,10 +251,80 @@ int Memory::timerBit() const {
 }
 
 void Memory::tick(int cycles) {
-    updateTimer(cycles);
-    updateDMA(cycles);
-    if (ppu) ppu->step(cycles);
-    if (apu) apu->step(cycles);
+    // Step everything one M-cycle at a time. The CPU usually calls this with a
+    // single M-cycle anyway, but finish() can top up several at once, and the
+    // PPU's OAM-scan row has to be attributed to the right M-cycle for the OAM
+    // corruption bug to land on the row hardware would have been reading.
+    for (int i = 0; i < cycles; i += 4) {
+        updateTimer(4);
+        updateDMA(4);
+        if (ppu) ppu->step(4);
+        if (apu) apu->step(4);
+    }
+}
+
+uint16_t Memory::oamWord(int row, int word) const {
+    size_t i = static_cast<size_t>(row) * 8 + static_cast<size_t>(word) * 2;
+    return static_cast<uint16_t>(oam[i] | (oam[i + 1] << 8));
+}
+
+void Memory::setOamWord(int row, int word, uint16_t v) {
+    size_t i = static_cast<size_t>(row) * 8 + static_cast<size_t>(word) * 2;
+    oam[i]     = static_cast<uint8_t>(v);
+    oam[i + 1] = static_cast<uint8_t>(v >> 8);
+}
+
+// Both single-access patterns mangle the row's first word using the row above
+// it, then copy that row's remaining three words down verbatim. Row 0 is wired
+// differently on hardware and never corrupts, which is why objects 0 and 1 are
+// the traditional safe place to park sprites.
+void Memory::oamCorruptWrite(int row) {
+    if (row <= 0 || row >= 20) return;
+    uint16_t a = oamWord(row, 0);
+    uint16_t b = oamWord(row - 1, 0);
+    uint16_t c = oamWord(row - 1, 2);
+    setOamWord(row, 0, static_cast<uint16_t>(((a ^ c) & (b ^ c)) ^ c));
+    for (int w = 1; w < 4; ++w) setOamWord(row, w, oamWord(row - 1, w));
+}
+
+void Memory::oamCorruptRead(int row) {
+    if (row <= 0 || row >= 20) return;
+    uint16_t a = oamWord(row, 0);
+    uint16_t b = oamWord(row - 1, 0);
+    uint16_t c = oamWord(row - 1, 2);
+    setOamWord(row, 0, static_cast<uint16_t>(b | (a & c)));
+    for (int w = 1; w < 4; ++w) setOamWord(row, w, oamWord(row - 1, w));
+}
+
+// A read sharing its M-cycle with an increment/decrement puts both a read and a
+// glitched write on the bus at once, which smears the preceding row across
+// three rows before the ordinary read corruption is applied on top.
+void Memory::oamCorruptReadWrite(int row) {
+    if (row >= 4 && row <= 18) {
+        uint16_t a = oamWord(row - 2, 0);
+        uint16_t b = oamWord(row - 1, 0);
+        uint16_t c = oamWord(row, 0);
+        uint16_t d = oamWord(row - 1, 2);
+        setOamWord(row - 1, 0,
+                   static_cast<uint16_t>((b & (a | c | d)) | (a & c & d)));
+        for (int w = 0; w < 4; ++w) {
+            uint16_t v = oamWord(row - 1, w);
+            setOamWord(row,     w, v);
+            setOamWord(row - 2, w, v);
+        }
+    }
+    oamCorruptRead(row);
+}
+
+void Memory::oamBugAccess(uint16_t addr, OamBugOp op) {
+    if (addr < 0xFE00 || addr > 0xFEFF) return;
+    if (!ppu || !ppu->oamScanActive()) return;
+    int row = ppu->oamScanRow();
+    switch (op) {
+        case OamBugOp::Read:      oamCorruptRead(row);      break;
+        case OamBugOp::Write:     oamCorruptWrite(row);     break;
+        case OamBugOp::ReadWrite: oamCorruptReadWrite(row); break;
+    }
 }
 
 void Memory::updateTimer(int cycles) {
