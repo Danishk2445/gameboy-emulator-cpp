@@ -1,77 +1,52 @@
-
-
-<img width="641" height="601" alt="Screenshot_20260519_105801" src="https://github.com/user-attachments/assets/4a1201bf-0a4e-4d33-8b3a-3977e8cc9778" />
-<img width="636" height="600" alt="Screenshot_20260519_105719" src="https://github.com/user-attachments/assets/b01ca965-0f6b-43fb-ad69-bc487db7c3dc" />
-<img width="642" height="605" alt="Screenshot_20260519_105658" src="https://github.com/user-attachments/assets/402f24b1-4c24-4a9f-bef1-e5b713aae93e" />
-
 # Game Boy Emulator
 
-A Game Boy (DMG) emulator written in C++ using SDL2 for video, input, and audio.
+An original Game Boy (DMG) emulator written in C++20 with SDL3.
 
-## Requirements
+<p>
+  <img src="docs/screenshots/links-awakening.png" width="24%" alt="Link's Awakening DX">
+  <img src="docs/screenshots/pokemon-red.png" width="24%" alt="Pokémon Red">
+  <img src="docs/screenshots/tetris.png" width="24%" alt="Tetris">
+  <img src="docs/screenshots/dr-mario.png" width="24%" alt="Dr. Mario">
+</p>
 
-- A C++17 compiler (e.g. `g++` or `clang++`)
-- `make`
-- SDL2 development headers (`sdl2-config` must be on `PATH`)
+<img src="docs/screenshots/debugger.png" alt="Debugger window">
 
-### Installing SDL2
+## Features
 
-- **Arch Linux:** `sudo pacman -S sdl2`
-- **Debian / Ubuntu:** `sudo apt install libsdl2-dev`
-- **Fedora:** `sudo dnf install SDL2-devel`
-- **macOS (Homebrew):** `brew install sdl2`
+- M-cycle accurate CPU and timer, scanline PPU, all four sound channels
+- Cartridge types: ROM only, MBC1, MBC2, MBC3 with real-time clock, and MBC5
+- Battery saves, 4 save-state slots, fast-forward and pause
+- Debugger window with disassembly, tile/map/sprite viewers and breakpoints
+- Headless mode for automated test ROMs
+- Passes Blargg's CPU and timing tests, most of Mooneye's acceptance tests and dmg-acid2
 
-## Building
+Game Boy Color–only games and Game Boy Advance ROMs are not supported.
 
-From the project root:
+## Build
 
-```sh
-make
-```
-
-This produces an executable named `gameboy` in the current directory.
-
-To clean build artifacts:
-
-```sh
-make clean
-```
-
-## Running
-
-Launch with a ROM file:
+Requires CMake, a C++20 compiler and SDL3.
 
 ```sh
-./gameboy path/to/rom.gb
-```
-
-Or launch without arguments to start with the menu open:
-
-```sh
-./gameboy
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/gbemu path/to/game.gb
 ```
 
 ## Controls
 
-| Key         | Action     |
-| ----------- | ---------- |
-| Arrow keys  | D-Pad      |
-| Z           | A          |
-| X           | B          |
-| Enter       | Start      |
-| Backspace   | Select     |
+| Key | Action | Key | Action |
+|---|---|---|---|
+| Arrows | D-pad | Tab (hold) | Fast-forward |
+| X / Z | A / B | P | Pause |
+| Enter | Start | F1–F4 / Shift+F1–F4 | Save / load state |
+| Backspace | Select | F10 | Debugger |
 
-### Hotkeys
+Press **H** in the emulator for the full list. Gamepads are supported.
 
-| Key       | Action                          |
-| --------- | ------------------------------- |
-| F1 / Esc  | Open menu / pause overlay       |
-| F2        | Save state (current slot)       |
-| F4        | Load state (current slot)       |
-| F6 / F7   | Save-state slot -1 / +1         |
-| F8        | Screenshot                      |
-| F9        | Reset                           |
-| F11       | Toggle fullscreen               |
-| P         | Toggle pause                    |
-| Space     | Fast-forward (hold)             |
-| M         | Toggle mute                     |
+## Tests
+
+```sh
+python3 tests/run_tests.py
+```
+
+This downloads the Blargg, Mooneye and dmg-acid2 test ROMs and runs them headless.
